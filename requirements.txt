@@ -2,3 +2,8 @@ Flask
 opencv-python
 pytesseract
 numpy
+requests
+PyPDF2
+PyMuPDF
+pyzbar
+Pillow

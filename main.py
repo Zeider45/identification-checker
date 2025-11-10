@@ -71,35 +71,12 @@ def process_bytes(file_bytes: bytes, filename: str, role: str) -> Dict[str, Any]
     out: Dict[str, Any] = {'role': role, 'filename': filename, 'type': None, 'qr': [], 'ocr_text': None, 'cedula_refined': None, 'validation': None, 'error': None}
 
     try:
-        is_pdf = filename.lower().endswith('.pdf')
-        if is_pdf:
-            out['type'] = 'pdf'
-            scan_res = qr_mod._scan_pdf(file_bytes)
-            # separar QR y texto
-            qr_items = [r for r in scan_res if isinstance(r, dict) and r.get('data')]
-            pdf_texts = [r.get('pdf_text') for r in scan_res if isinstance(r, dict) and r.get('pdf_text')]
-            if qr_items:
-                out['qr'] = qr_items
-                # seguir URLs dentro de los QR
-                for r in out['qr']:
-                    data_field = r.get('data')
-                    if isinstance(data_field, str) and (data_field.startswith('http://') or data_field.startswith('https://')):
-                        try:
-                            r['remote'] = qr_mod._fetch_and_extract(data_field)
-                        except Exception as e:
-                            r['remote'] = {'error': str(e)}
-            else:
-                if pdf_texts:
-                    out['ocr_text'] = '\n\n'.join([t for t in pdf_texts if t])
-                    # intentar validación con id_mod si está disponible
-                    try:
-                        db_path = getattr(id_mod, 'DEFAULT_DB_PATH', os.path.join(BASE, 'database_example.json'))
-                        threshold = getattr(id_mod, 'DEFAULT_THRESHOLD', 15.0)
-                        out['validation'] = id_mod.validate_against_db(out['ocr_text'], db_path=db_path, threshold=threshold)
-                    except Exception:
-                        out['validation'] = None
+            # Ya no se soportan archivos PDF en la API; sólo imágenes
+            if filename.lower().endswith('.pdf'):
+                out['type'] = 'pdf'
+                out['error'] = 'pdf files are not supported; please upload an image'
+                return out
 
-        else:
             out['type'] = 'image'
             img = qr_mod._image_from_bytes(file_bytes)
             if img is None:

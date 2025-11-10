@@ -4,6 +4,5 @@ pytesseract
 numpy
 requests
 PyPDF2
-PyMuPDF
 pyzbar
 Pillow

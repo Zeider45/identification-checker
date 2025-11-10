@@ -3,6 +3,8 @@ import io
 import sys
 # importar tipos para anotaciones: listas, diccionarios, Any, Optional, Set y Tuple
 from typing import List, Dict, Any, Optional, Set, Tuple
+import re
+import html as _html_lib
 
 # Flask: framework web ligero
 from flask import Flask, request, jsonify
@@ -10,8 +12,6 @@ from flask import Flask, request, jsonify
 import cv2
 # numpy para manipular arrays de imagen
 import numpy as np
-# PyMuPDF (fitz) para trabajar con PDFs
-import fitz  # PyMuPDF
 # requests para bajar recursos remotos
 import requests
 # Pillow para abrir imágenes (fallback/ocr)
@@ -238,45 +238,252 @@ def _detect_qr(img: np.ndarray) -> List[Dict[str, Any]]:
     return results
 
 
-def _scan_pdf(file_bytes: bytes) -> List[Dict[str, Any]]:
-    """Renderiza cada página del PDF y busca códigos QR.
+def _parse_fields_from_text(text: str) -> Dict[str, Any]:
+    """Intenta extraer campos útiles del texto OCR: fechas, nombre, dirección y número de RIF.
 
-    Devuelve resultados con número de página si se encuentran.
+    Devuelve un dict con keys: 'dates' (lista), 'name' (str|None), 'address' (str|None), 'rif' (str|None).
+    Usa heurísticas simples: busca etiquetas comunes ('nombre', 'dirección', 'rif') y patrones regex.
     """
-    # lista donde acumulamos resultados
-    results: List[Dict[str, Any]] = []
-    try:
-        # abrimos el PDF desde bytes
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-    except Exception as e:
-        # si falla la apertura, devolvemos un error en la lista
-        return [{"error": f"failed to open pdf: {e}"}]
+    if not text:
+        return {"dates": [], "name": None, "address": None, "rif": None}
 
-    # recorremos cada página y la renderizamos a imagen
-    for i in range(len(doc)):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(dpi=200)
-        png_bytes = pix.tobytes("png")
-        img = _image_from_bytes(png_bytes)
-        page_results = _detect_qr(img)
-        for r in page_results:
-            # añadimos el número de página si se encontró QR
-            r["page"] = i + 1
-        results.extend(page_results)
+    txt = text.replace('\r', '\n')
+    # normalizar espacios
+    txt_norm = '\n'.join(line.strip() for line in txt.splitlines() if line.strip())
+    lower = txt_norm.lower()
 
-    # Intentamos también extraer texto del PDF (por si el archivo contiene texto legible)
+    # buscar fechas comunes (DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD.MM.YYYY)
+    import re
+    dates = []
+    date_patterns = [r"\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b", r"\b\d{4}-\d{2}-\d{2}\b"]
+    for pat in date_patterns:
+        for m in re.findall(pat, txt_norm):
+            if m not in dates:
+                dates.append(m)
+
+    # buscar RIF: etiqueta explícita o patrón (V/J/E/P/G etc.)
+    rif = None
+    # intento con etiqueta
+    m = re.search(r"rif[:\s]*([VEJPG\-\s]?\d{6,9}-?\d?)", lower, flags=re.IGNORECASE)
+    if m:
+        rif_raw = m.group(1)
+        rif = re.sub(r"\s+", "", rif_raw).upper()
+    else:
+        # patrón suelto: letra opcional + números
+        m2 = re.search(r"\b([VEJPG])[-\s]?(\d{6,9})(?:[-\s]?(\d))?\b", txt_norm, flags=re.IGNORECASE)
+        if m2:
+            parts = [m2.group(1).upper(), m2.group(2)]
+            if m2.group(3):
+                parts.append(m2.group(3))
+            rif = '-'.join([p for p in parts if p])
+
+    # buscar nombre por etiqueta
+    name = None
+    addr = None
+    lines = txt_norm.splitlines()
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if 'nombre' in low:
+            # tomar la parte después de ':' si existe, sino la línea siguiente
+            if ':' in line:
+                name = line.split(':', 1)[1].strip()
+            elif i + 1 < len(lines):
+                name = lines[i + 1].strip()
+            else:
+                # fallback: todo el line
+                name = line.strip()
+        if any(k in low for k in ('dirección', 'direccion', 'domicilio', 'dir')):
+            if ':' in line:
+                addr = line.split(':', 1)[1].strip()
+            elif i + 1 < len(lines):
+                addr = lines[i + 1].strip()
+            else:
+                addr = line.strip()
+
+    # heurística adicional para nombre (línea en mayúsculas sin dígitos con 2-4 palabras)
+    if not name:
+        for line in lines:
+            if any(ch.isdigit() for ch in line):
+                continue
+            words = [w for w in line.split() if len(w) > 1]
+            if 2 <= len(words) <= 4 and line == line.upper():
+                name = line.strip()
+                break
+
+    # heurística adicional para dirección (línea que contiene 'Av.' 'Calle' 'Sector' 'Casa' o números y letras)
+    if not addr:
+        for line in lines:
+            if any(tok in line.lower() for tok in ('calle', 'av.', 'avenida', 'sector', 'casa', 'zip', 'zona', 'parroquia')):
+                addr = line.strip()
+                break
+
+    return {"dates": dates, "name": name or None, "address": addr or None, "rif": rif or None}
+
+
+def _html_to_text(html_text: str) -> str:
+    """Convierte HTML simple a texto plano conservando saltos de línea útiles.
+
+    Reemplaza <br>, </tr>, </td>, </p> por saltos de línea antes de eliminar tags.
+    Luego desescapea entidades HTML.
+    """
+    if not html_text:
+        return ""
+
+    # unescape primero para manejar &nbsp; y caracteres especiales
     try:
-        text_pages = []
-        for i in range(len(doc)):
-            page = doc.load_page(i)
-            text_pages.append(page.get_text("text"))
-        if any(p.strip() for p in text_pages):
-            results.append({"pdf_text": "\n\n".join(text_pages)})
+        s = _html_lib.unescape(html_text)
     except Exception:
-        # ignoramos errores durante la extracción de texto
-        pass
+        s = html_text
 
-    return results
+    # normalizar saltos de línea en etiquetas comunes
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</tr>", "\n", s)
+    s = re.sub(r"(?i)</td>", "\n", s)
+    s = re.sub(r"(?i)</p>", "\n", s)
+
+    # eliminar cualquier tag restante
+    s = re.sub(r"<[^>]+>", "", s)
+
+    # convertir múltiples espacios y &nbsp; a espacios simples
+    s = s.replace('\xa0', ' ')
+    s = re.sub(r"[ \t\x0b\f\r]+", " ", s)
+
+    # normalizar líneas: limpiar espacios en cada línea y eliminar vacías
+    lines = [ln.strip() for ln in s.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
+def _parse_rif_html(html_text: str) -> Dict[str, Any]:
+    """Extrae campos estructurados del HTML retornado por el SENIAT para RIF.
+
+    Campos extraídos (cuando estén disponibles):
+      - numero_comprobante
+      - rif
+      - nombre
+      - domicilio
+      - zona_postal
+      - fecha_inscripcion
+      - fecha_ultima_actualizacion
+      - fecha_vencimiento
+      - gerencia
+      - firma_autorizada (código si aparece)
+      - raw_text
+
+    La función es tolerante y usa heurísticas sobre el texto plano generado desde el HTML.
+    """
+    text = _html_to_text(html_text)
+    if not text:
+        return {}
+
+    out: Dict[str, Any] = {"raw_text": text}
+
+    # buscar número de comprobante
+    m = re.search(r"COMPROBANTE[^A-Z0-9\n\r\-]*([A-Z0-9\-]+)", text, flags=re.IGNORECASE)
+    if m:
+        out["numero_comprobante"] = m.group(1).strip()
+
+    # buscar RIF (primera ocurrencia de formato: letra + números)
+    rif_match = re.search(r"\b([VEJPG])[-\s]?(\d{6,9})(?:[-\s]?(\d))?\b", text, flags=re.IGNORECASE)
+    if rif_match:
+        parts = [rif_match.group(1).upper(), rif_match.group(2)]
+        if rif_match.group(3):
+            parts.append(rif_match.group(3))
+        rif_val = "-".join(parts)
+        out["rif"] = rif_val
+
+        # intentar tomar el nombre que sigue en la misma línea
+        for line in text.splitlines():
+            if rif_match.group(2) in line:
+                # encontrar la porción después del rif dentro de la línea
+                # buscamos la posición del patrón en la línea raw
+                line_un = line
+                try:
+                    # ubicar la ocurrencia del número dentro de la línea
+                    idx = line_un.find(rif_match.group(0))
+                except Exception:
+                    idx = -1
+                if idx != -1:
+                    name_part = line_un[idx + len(rif_match.group(0)):].strip()
+                    if name_part:
+                        out["nombre"] = name_part
+                break
+
+    # domicilio fiscal
+    m_dom = re.search(r"DOMICILIO\s+FISCAL\s*(.*?)(?:ZONA\s+POSTAL|ZONA\s+POSTAL|ZONA|$)", text, flags=re.IGNORECASE | re.DOTALL)
+    if m_dom:
+        dom = m_dom.group(1).strip()
+        # limpiar espacios excesivos
+        dom = re.sub(r"\s+", " ", dom)
+        out["domicilio"] = dom
+
+    # zona postal
+    m_zp = re.search(r"ZONA\s+POSTAL\s*[:\s]*([0-9]{3,6})", text, flags=re.IGNORECASE)
+    if m_zp:
+        out["zona_postal"] = m_zp.group(1)
+
+    # gerencia / sede
+    ger_line = None
+    for line in text.splitlines():
+        if 'GERENCIA' in line.upper() or 'SEDE REGIONAL' in line.upper():
+            ger_line = line.strip()
+            break
+    if ger_line:
+        out["gerencia"] = ger_line
+
+    # firma autorizada: buscar código cercano a la etiqueta
+    # buscar la línea que contiene FIRMA AUTORIZADA y tomar la línea anterior si tiene patrón con guion
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if 'FIRMA AUTORIZADA' in line.upper():
+            # buscar en la misma línea algún token con dígitos y guion
+            code = None
+            mcode = re.search(r"([0-9]{6,}-[A-Z0-9]{1,6})", line)
+            if mcode:
+                code = mcode.group(1)
+            else:
+                # revisar línea previa
+                if i > 0:
+                    prev = lines[i-1]
+                    m2 = re.search(r"([0-9]{6,}-[A-Z0-9]{1,6})", prev)
+                    if m2:
+                        code = m2.group(1)
+            if code:
+                out["firma_autorizada"] = code
+            break
+
+    # buscar fechas específicas (inscripción, última actualización, vencimiento)
+    date_pat = r"\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b"
+    def find_date_after(label: str) -> Optional[str]:
+        lab = label.lower()
+        lo = text.lower()
+        idx = lo.find(lab)
+        if idx == -1:
+            return None
+        tail = text[idx:idx+200]
+        m = re.search(date_pat, tail)
+        if m:
+            return m.group(0)
+        # fallback: buscar en todo el texto cercano
+        m2 = re.search(date_pat, text[idx:idx+400])
+        if m2:
+            return m2.group(0)
+        return None
+
+    fi = find_date_after('FECHA DE INSCRIPCI') or find_date_after('FECHA DE INSCRIPCION')
+    fu = find_date_after('FECHA DE &Uacute;LTIMA') or find_date_after('FECHA DE ULTIMA') or find_date_after('FECHA DE ÚLTIMA')
+    fv = find_date_after('FECHA DE VENCIMIENTO')
+    if fi:
+        out['fecha_inscripcion'] = fi
+    if fu:
+        out['fecha_ultima_actualizacion'] = fu
+    if fv:
+        out['fecha_vencimiento'] = fv
+
+    return out
+
+
+# Nota: soporte de PDF eliminado. Solo se aceptan imágenes.
 
 
 def _fetch_and_extract(url: str, max_size: int = 20 * 1024 * 1024) -> Dict[str, Any]:
@@ -309,22 +516,10 @@ def _fetch_and_extract(url: str, max_size: int = 20 * 1024 * 1024) -> Dict[str, 
 
     # decidir cómo extraer según el content-type o extensión
     lc = content_type.lower()
-    # si es PDF, intentar extraer texto con PyMuPDF
+    # PDF ya no está soportado: devolvemos un mensaje claro
     if "pdf" in lc or url.lower().endswith(".pdf"):
-        try:
-            try:
-                doc = fitz.open(stream=bytes(data), filetype="pdf")
-            except Exception:
-                doc = fitz.open(stream=bytes(data))
-            texts = []
-            for i in range(len(doc)):
-                page = doc.load_page(i)
-                texts.append(page.get_text("text"))
-            res["extracted_text"] = "\n\n".join(texts)
-            return res
-        except Exception as e:
-            res["error"] = f"pdf extraction failed: {e}"
-            return res
+        res["error"] = "pdf content not supported"
+        return res
 
     # si es imagen, intentar OCR con pytesseract
     if "image" in lc or any(url.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
@@ -336,6 +531,9 @@ def _fetch_and_extract(url: str, max_size: int = 20 * 1024 * 1024) -> Dict[str, 
             try:
                 txt = pytesseract.image_to_string(img)
                 res["extracted_text"] = txt
+                # parsear campos estructurados si hay texto
+                if txt and txt.strip():
+                    res["extracted_fields"] = _parse_fields_from_text(txt)
             except Exception as e:
                 # si falla OCR, registramos el error
                 res["ocr_error"] = str(e)
@@ -349,6 +547,17 @@ def _fetch_and_extract(url: str, max_size: int = 20 * 1024 * 1024) -> Dict[str, 
         try:
             text = bytes(data).decode("utf-8", errors="replace")
             res["extracted_text"] = text
+            # si parece HTML, intentar parsearlo como tal para extraer campos del RIF
+            if "<html" in text.lower() or "<body" in text.lower():
+                try:
+                    parsed = _parse_rif_html(text)
+                    # incluir parsed sólo si hay algún campo útil
+                    if parsed:
+                        res["extracted_fields"] = parsed
+                except Exception:
+                    # no fallar en caso de parsing
+                    pass
+
             return res
         except Exception as e:
             res["error"] = f"text decode failed: {e}"
@@ -376,15 +585,15 @@ def scan():
     results: List[Dict[str, Any]] = []
 
     try:
-        # si parece un PDF, lo procesamos como tal
+        # No se aceptan PDFs: sólo imágenes
         if filename.endswith(".pdf") or f.mimetype == "application/pdf":
-            results = _scan_pdf(data)
-        else:
-            # si es una imagen, intentamos decodificar y detectar QR
-            img = _image_from_bytes(data)
-            if img is None:
-                return jsonify({"ok": False, "error": "invalid image file", "results": []}), 400
-            results = _detect_qr(img)
+            return jsonify({"ok": False, "error": "pdf files are not supported, please upload an image", "results": []}), 400
+
+        # si es una imagen, intentamos decodificar y detectar QR
+        img = _image_from_bytes(data)
+        if img is None:
+            return jsonify({"ok": False, "error": "invalid image file", "results": []}), 400
+        results = _detect_qr(img)
 
         # si cualquier resultado contiene un error, respondemos con 400
         if any(isinstance(r, dict) and r.get("error") for r in results):
